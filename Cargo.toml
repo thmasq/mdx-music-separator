@@ -1,0 +1,17 @@
+[package]
+name = "mdx-music-separator"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+apodize = "1.0.0"
+burn = { version = "0.19.1", features = ["default", "wgpu", "autodiff", "ndarray", "train"] }
+burn-import = "0.19.1"
+burn-ndarray = { version = "0.19.1", features = ["blas-openblas"] }
+clap = { version = "4.5.52", features = ["derive"] }
+glob = "0.3.3"
+hound = "3.5.1"
+indicatif = "0.18.3"
+kofft = { version = "0.1.5", features = ["rayon", "parallel", "sse", "x86_64"] }
+reqwest = { version = "0.12.24", features = ["blocking"] }
+zip = "6.0.0"

@@ -168,37 +168,42 @@ pub fn istft<B: Backend>(
             .into_vec::<f32>()
             .expect("Failed to get STFT vec");
 
-        // 3. Convert flat Vec<f32> back to kofft's expected format:
-        // &[Vec<Complex32>] (shape [n_frames, n_bins])
+        // 3. Convert flat Vec<f32> back to kofft's expected format.
         let mut kofft_input: Vec<Vec<Complex32>> =
-            vec![vec![Complex32::new(0.0, 0.0); n_bins]; n_frames];
+            vec![vec![Complex32::new(0.0, 0.0); n_fft]; n_frames];
 
-        for f in 0..n_bins {
-            for t in 0..n_frames {
+        for t in 0..n_frames {
+            // 3a. Fill the positive frequencies (0 to Nyquist)
+            for f in 0..n_bins {
                 let in_idx = (f * n_frames + t) * 2;
                 kofft_input[t][f] =
                     Complex32::new(flat_stft_vec[in_idx], flat_stft_vec[in_idx + 1]);
             }
+
+            // 3b. Fill the negative frequencies using conjugate symmetry
+            // This reconstructs the full Hermitian spectrum required by kofft.
+            for f in n_bins..n_fft {
+                let sym_idx = n_fft - f;
+                let val = kofft_input[t][sym_idx];
+                kofft_input[t][f] = Complex32::new(val.re, -val.im);
+            }
         }
 
         // 4. Perform iSTFT
-        // We need to know the output length for the buffer
         let expected_len = n_fft + (n_frames - 1) * hop;
         let mut audio_out = vec![0.0f32; expected_len];
 
-        // Call kofft_istft
-        // Signature: istft(frames: &[Vec<Complex32>], window: &[f32], hop_size: usize, output: &mut [f32])
+        // This should now pass without panicking
         kofft_istft(&kofft_input, &window_vec, hop, &mut audio_out).expect("kofft iSTFT failed");
 
-        // 5. Trim/pad to final length
-        // This logic is identical to the previous implementation
+        // 5. Trim/pad to final length (Unchanged)
         let mut final_audio = if center {
             let pad_len = n_fft / 2;
             let expected_len = audio_out.len();
             if expected_len > pad_len * 2 {
                 audio_out[pad_len..expected_len - pad_len].to_vec()
             } else {
-                Vec::new() // Padded length was less than trim length
+                Vec::new()
             }
         } else {
             audio_out

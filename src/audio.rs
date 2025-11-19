@@ -2,12 +2,10 @@ use burn::{
     prelude::{Backend, Tensor},
     tensor::Int,
 };
-// --- NEW IMPORTS ---
 use kofft::{
     fft::Complex32,
     stft::{istft as kofft_istft, stft as kofft_stft},
 };
-// --- END NEW IMPORTS ---
 use std::f32::consts::PI;
 
 /// Generates a Hanning window. (Unchanged, still needed by model.rs)
@@ -125,7 +123,7 @@ pub fn stft<B: Backend>(
         }
 
         // 6. Convert to tensor [n_bins, n_frames, 2]
-        let stft_tensor = Tensor::<B, 3>::from_floats(flat_tensor_data.as_slice(), &device)
+        let stft_tensor = Tensor::<B, 1>::from_floats(flat_tensor_data.as_slice(), &device)
             .reshape([n_bins, n_frames, 2]);
 
         batch_outputs.push(stft_tensor);

@@ -2,7 +2,7 @@ use crate::audio::{hanning_window, istft, stft};
 use burn::{
     module::Module,
     nn::{
-        PaddingConfig2d, // Moved from conv
+        PaddingConfig2d,
         conv::{Conv2d, Conv2dConfig, ConvTranspose2d, ConvTranspose2dConfig},
     },
     prelude::{Backend, Config, Tensor},
@@ -13,16 +13,13 @@ const DIM_C: usize = 4;
 const DIM_T: usize = 256;
 
 /// Configuration for the MDX-B model.
-///
-/// This struct holds the parameters required to build the model,
-/// matching the `__init__` method of the Python `Conv_TDF_net_trim_model`.
 #[derive(Config, Debug, Copy)]
 pub struct ConvTdfNetTrimModelConfig {
-    /// Number of layers in the U-Net encoder/decoder (L=11 in Python -> n=5)
+    /// Number of layers in the U-Net encoder/decoder
     #[config(default = 11)]
     pub l_layers: usize,
 
-    /// FFT window size (e.g., 6144 or 7680)
+    /// FFT window size
     #[config(default = 6144)]
     pub n_fft: usize,
 
@@ -35,8 +32,25 @@ pub struct ConvTdfNetTrimModelConfig {
     pub dim_f: usize,
 
     /// Overlap margin (percentage)
-    #[config(default = 0.01)] // 1% overlap margin
+    #[config(default = 0.01)]
     pub margin: f64,
+}
+
+/// A Dense Block consisting of 3 consecutive convolutions.
+#[derive(Module, Debug)]
+pub struct DenseBlock<B: Backend> {
+    pub layer_0: Conv2d<B>,
+    pub layer_1: Conv2d<B>,
+    pub layer_2: Conv2d<B>,
+}
+
+impl<B: Backend> DenseBlock<B> {
+    pub fn forward(&self, mut x: Tensor<B, 4>) -> Tensor<B, 4> {
+        x = self.layer_0.forward(x);
+        x = self.layer_1.forward(x);
+        x = self.layer_2.forward(x);
+        x
+    }
 }
 
 impl ConvTdfNetTrimModelConfig {
@@ -45,21 +59,26 @@ impl ConvTdfNetTrimModelConfig {
         let n = self.l_layers / 2; // n=5
         let n_bins = self.n_fft / 2 + 1;
 
-        // --- Layer Definitions (Based on U-Net structure) ---
-        // These parameters (channels, kernels) are not in inference.py,
-        // so we define a plausible U-Net architecture.
-        // These *must* match the parameters of the model you are loading weights from.
+        // --- Validation Check ---
+        if n_bins < self.dim_f {
+            panic!(
+                "Invalid Configuration: n_fft ({}) produces {} bins, which is less than dim_f ({}). \
+                 For 'Trim' models, n_bins must be >= dim_f.",
+                self.n_fft, n_bins, self.dim_f
+            );
+        }
 
-        let channels: [usize; 6] = [4, 32, 64, 128, 256, 512]; // Guessed channel sizes
+        // Channels matching the KimModelFused architecture
+        let channels: [usize; 7] = [4, 48, 96, 144, 192, 240, 288];
+
         let kernel_size = [3, 3];
         let stride = [2, 2];
         let padding_same = PaddingConfig2d::Same;
-        let padding_explicit = PaddingConfig2d::Explicit(1, 1);
 
         // --- Entry Conv ---
         let first_conv = Conv2dConfig::new(
-            [channels[0], channels[1]], // 4 -> 32
-            kernel_size,
+            [channels[0], channels[1]], // 4 -> 48
+            [1, 1],                     // kernel_size=1
         )
         .with_padding(padding_same.clone())
         .init(device);
@@ -67,53 +86,90 @@ impl ConvTdfNetTrimModelConfig {
         // --- Encoder (n=5) ---
         let mut ds_dense = Vec::with_capacity(n);
         let mut ds = Vec::with_capacity(n);
+
         for i in 0..n {
-            ds_dense.push(
-                Conv2dConfig::new([channels[i + 1], channels[i + 1]], kernel_size)
+            let c_in = channels[i + 1];
+
+            // Dense Block
+            ds_dense.push(DenseBlock {
+                layer_0: Conv2dConfig::new([c_in, c_in], kernel_size)
                     .with_padding(padding_same.clone())
                     .init(device),
-            );
+                layer_1: Conv2dConfig::new([c_in, c_in], kernel_size)
+                    .with_padding(padding_same.clone())
+                    .init(device),
+                layer_2: Conv2dConfig::new([c_in, c_in], kernel_size)
+                    .with_padding(padding_same.clone())
+                    .init(device),
+            });
+
+            // Downsample
             ds.push(
-                Conv2dConfig::new([channels[i + 1], channels[i + 2]], kernel_size)
+                Conv2dConfig::new([channels[i + 1], channels[i + 2]], [2, 2])
                     .with_stride(stride)
-                    .with_padding(padding_explicit.clone())
+                    .with_padding(PaddingConfig2d::Explicit(0, 0))
                     .init(device),
             );
         }
 
         // --- Bottleneck ---
-        let mid_dense = Conv2dConfig::new([channels[n], channels[n]], kernel_size)
-            .with_padding(padding_same.clone())
-            .init(device);
+        let c_mid = channels[n + 1]; // 288
+        let mid_dense = DenseBlock {
+            layer_0: Conv2dConfig::new([c_mid, c_mid], kernel_size)
+                .with_padding(padding_same.clone())
+                .init(device),
+            layer_1: Conv2dConfig::new([c_mid, c_mid], kernel_size)
+                .with_padding(padding_same.clone())
+                .init(device),
+            layer_2: Conv2dConfig::new([c_mid, c_mid], kernel_size)
+                .with_padding(padding_same.clone())
+                .init(device),
+        };
 
         // --- Decoder (n=5) ---
         let mut us = Vec::with_capacity(n);
         let mut us_dense = Vec::with_capacity(n);
+
+        // Iterate backwards: i = 4, 3, 2, 1, 0
         for i in (0..n).rev() {
+            let c_deep = channels[i + 2];
+            let c_shallow = channels[i + 1];
+
+            // Upsample
             us.push(
-                ConvTranspose2dConfig::new([channels[i + 2], channels[i + 1]], kernel_size)
+                ConvTranspose2dConfig::new([c_deep, c_shallow], [2, 2])
                     .with_stride(stride)
-                    .with_padding([1, 1])
-                    .with_padding_out([1, 1])
+                    .with_padding([0, 0])
                     .init(device),
             );
-            us_dense.push(
-                Conv2dConfig::new([channels[i + 1] * 2, channels[i + 1]], kernel_size) // *2 for skip connection
+
+            // Dense Block
+            us_dense.push(DenseBlock {
+                layer_0: Conv2dConfig::new([c_shallow, c_shallow], kernel_size)
                     .with_padding(padding_same.clone())
                     .init(device),
-            );
+                layer_1: Conv2dConfig::new([c_shallow, c_shallow], kernel_size)
+                    .with_padding(padding_same.clone())
+                    .init(device),
+                layer_2: Conv2dConfig::new([c_shallow, c_shallow], kernel_size)
+                    .with_padding(padding_same.clone())
+                    .init(device),
+            });
         }
 
         // --- Exit Conv ---
-        let final_conv = Conv2dConfig::new([channels[1], channels[0]], kernel_size) // 32 -> 4
-            .with_padding(padding_same)
-            .init(device);
+        let final_conv = Conv2dConfig::new(
+            [channels[1], channels[0]], // 48 -> 4
+            [1, 1],                     // kernel_size=1
+        )
+        .with_padding(padding_same)
+        .init(device);
 
         // --- STFT Hann Window ---
         let stft_window = hanning_window(self.n_fft, false, &device.clone());
 
         // --- Frequency Padding ---
-        // out_c = 4 (since target_name != '*')
+        // Safe subtraction now guaranteed by check above
         let freq_pad = Tensor::<B, 4>::zeros([1, DIM_C, n_bins - self.dim_f, DIM_T], device);
 
         // --- Overlap-Add Window & Sizes ---
@@ -151,11 +207,11 @@ impl ConvTdfNetTrimModelConfig {
 pub struct ConvTdfNetTrimModel<B: Backend> {
     // --- Layers ---
     first_conv: Conv2d<B>,
-    ds_dense: Vec<Conv2d<B>>,
+    ds_dense: Vec<DenseBlock<B>>,
     ds: Vec<Conv2d<B>>,
-    mid_dense: Conv2d<B>,
+    mid_dense: DenseBlock<B>,
     us: Vec<ConvTranspose2d<B>>,
-    us_dense: Vec<Conv2d<B>>,
+    us_dense: Vec<DenseBlock<B>>,
     final_conv: Conv2d<B>,
 
     // --- STFT/iSTFT Parameters ---
@@ -174,101 +230,58 @@ pub struct ConvTdfNetTrimModel<B: Backend> {
 
 impl<B: Backend> ConvTdfNetTrimModel<B> {
     /// STFT function matching the Python implementation.
-    /// Input shape: [B, 2, chunk_size]
-    /// Output shape: [B, 4, dim_f, dim_t]
     pub fn stft(&self, x: Tensor<B, 3>) -> Tensor<B, 4> {
         let [batch_size, _channels, _chunk_size] = x.dims();
-
-        // 1. Reshape [B, 2, chunk_size] -> [B*2, chunk_size]
-        // Use -1isize for automatic dimension calculation
-        let x_reshaped: Tensor<B, 2> = x.reshape([-164, self.chunk_size as i64]);
-
-        // 2. Perform STFT
-        // Input: [B*2, chunk_size]
-        // Output: [B*2, n_bins, dim_t, 2]
+        let x_reshaped: Tensor<B, 2> = x.reshape([-1, self.chunk_size as i64]);
         let x_stft: Tensor<B, 4> = stft(
             x_reshaped,
             self.n_fft,
             self.hop,
-            Some(self.n_fft), // win_length
+            Some(self.n_fft),
             Some(self.stft_window.clone()),
-            true,  // center
-            None,  // pad_mode
-            false, // normalized
-            true,  // onesided
-            false, // return_complex
+            true,
+            None,
+            false,
+            true,
+            false,
         );
-
-        // 3. Permute [B*2, n_bins, dim_t, 2] -> [B*2, 2, n_bins, dim_t]
         let x_permuted = x_stft.permute([0, 3, 1, 2]);
-
-        // 4. Reshape [B*2, 2, n_bins, dim_t] -> [B, 2, 2, n_bins, dim_t]
         let x_reshaped_2 = x_permuted.reshape([batch_size, 2, 2, self.n_bins, self.dim_t]);
-
-        // 5. Reshape [B, 2, 2, n_bins, dim_t] -> [B, 4, n_bins, dim_t]
         let x_final_shape: Tensor<B, 4> =
             x_reshaped_2.reshape([batch_size, DIM_C, self.n_bins, self.dim_t]);
-
-        // 6. Slice to dim_f: [B, 4, n_bins, dim_t] -> [B, 4, dim_f, dim_t]
         x_final_shape.slice([0..batch_size, 0..DIM_C, 0..self.dim_f, 0..self.dim_t])
     }
 
     /// iSTFT function matching the Python implementation.
-    /// Input shape: [B, 4, dim_f, dim_t]
-    /// Output shape: [B, 2, chunk_size]
     pub fn istft(&self, x: Tensor<B, 4>) -> Tensor<B, 3> {
         let [batch_size, _, _, _] = x.dims();
-
-        // 1. Concatenate frequency padding
-        // freq_pad is [1, 4, n_bins - dim_f, dim_t], we need [B, 4, ...]
-        // The `repeat` API takes a slice for new dims.
-        // We repeat `batch_size` times on the 0th dim, and 1 for all others.
         let freq_pad_cloned = self.freq_pad.clone().repeat(&[batch_size]);
-        // x: [B, 4, dim_f, dim_t]
-        // freq_pad: [B, 4, n_bins - dim_f, dim_t]
-        // output: [B, 4, n_bins, dim_t]
         let x_padded = Tensor::cat(vec![x, freq_pad_cloned], 2);
-
-        // 2. Reshape [B, 4, n_bins, dim_t] -> [B, 2, 2, n_bins, dim_t]
         let x_reshaped = x_padded.reshape([batch_size, 2, 2, self.n_bins, self.dim_t]);
-
-        // 3. Reshape [B, 2, 2, n_bins, dim_t] -> [B*2, 2, n_bins, dim_t]
-        let x_reshaped_2 = x_reshaped.reshape([-1i64, 2, self.n_bins as i64, self.dim_t as i64]);
-
-        // 4. Permute [B*2, 2, n_bins, dim_t] -> [B*2, n_bins, dim_t, 2]
-        // .contiguous() is not needed in Burn as layout is handled.
+        let x_reshaped_2 = x_reshaped.reshape([-1, 2, self.n_bins as i64, self.dim_t as i64]);
         let x_permuted = x_reshaped_2.permute([0, 2, 3, 1]);
-
-        // 5. Perform iSTFT
-        // Input: [B*2, n_bins, dim_t, 2]
-        // Output: [B*2, chunk_size]
         let x_istft: Tensor<B, 2> = istft(
             x_permuted,
             self.n_fft,
             self.hop,
-            Some(self.n_fft), // win_length
+            Some(self.n_fft),
             Some(self.stft_window.clone()),
-            true,                  // center
-            false,                 // normalized
-            true,                  // onesided
-            Some(self.chunk_size), // length
-            false,                 // return_complex
+            true,
+            false,
+            true,
+            Some(self.chunk_size),
+            false,
         );
-
-        // 6. Reshape [B*2, chunk_size] -> [B, 2, chunk_size]
         x_istft.reshape([batch_size, 2, self.chunk_size])
     }
 
     /// Forward pass through the U-Net.
-    /// Input shape: [B, 4, 3072, 256] (B, C, F, T)
-    /// Output shape: [B, 4, 3072, 256] (B, C, F, T)
     pub fn forward(&self, x: Tensor<B, 4>) -> Tensor<B, 4> {
         // [B, C, F, T]
         let x = self.first_conv.forward(x);
 
         // Transpose: [B, C, F, T] -> [B, C, T, F]
         // We treat (T, F) as (H, W) for 2D convolutions
-        // .transpose() swaps the last two dimensions
         let x = x.transpose();
 
         let mut ds_outputs = Vec::with_capacity(self.n);
@@ -276,8 +289,11 @@ impl<B: Backend> ConvTdfNetTrimModel<B> {
         // --- Encoder ---
         let mut x_enc = x;
         for i in 0..self.n {
+            // Run through dense block
             x_enc = self.ds_dense[i].forward(x_enc);
             ds_outputs.push(x_enc.clone());
+
+            // Downsample
             x_enc = self.ds[i].forward(x_enc);
         }
 
@@ -289,19 +305,17 @@ impl<B: Backend> ConvTdfNetTrimModel<B> {
             // Upsample
             x_dec = self.us[i].forward(x_dec);
 
-            // Get skip connection (from encoder, in reverse order)
+            // Get skip connection
             let skip_con = ds_outputs.pop().unwrap();
 
-            // Concatenate skip connection
-            // us_dense[i] has input channels C_in * 2
-            x_dec = Tensor::cat(vec![x_dec, skip_con], 1);
+            // Add skip connection (Summation for Kim models)
+            x_dec = x_dec + skip_con;
 
             // Dense block
             x_dec = self.us_dense[i].forward(x_dec);
         }
 
         // Transpose back: [B, C, T, F] -> [B, C, F, T]
-        // .transpose() swaps the last two dimensions
         let x_dec = x_dec.transpose();
 
         // --- Final Conv ---

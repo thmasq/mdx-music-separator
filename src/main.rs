@@ -49,18 +49,18 @@ fn main() -> Result<()> {
     }
 
     println!("Loading model from {:?}...", args.model);
-    let model = MDXModel::load(&args.model, args.n_fft, args.hop_length, args.segment_size)
+    let mut model = MDXModel::load(&args.model, args.n_fft, args.hop_length, args.segment_size)
         .context("Failed to initialize MDX model")?;
     println!("Model loaded successfully.");
 
     for input_path in &args.input {
-        process_file(&input_path, &args, &model)?;
+        process_file(&input_path, &args, &mut model)?;
     }
 
     Ok(())
 }
 
-fn process_file(path: &Path, args: &Args, model: &MDXModel) -> Result<()> {
+fn process_file(path: &Path, args: &Args, model: &mut MDXModel) -> Result<()> {
     println!("Processing {:?}...", path);
 
     // 1. Load Audio

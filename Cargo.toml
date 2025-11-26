@@ -1,0 +1,18 @@
+[package]
+name = "mdx-music-separator"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.100"
+apodize = "1.0.0"
+clap = { version = "4.5.53", features = ["derive"] }
+hound = "3.5.1"
+ndarray = { version = "0.16.1", features = ["rayon", "matrixmultiply-threading"] }
+ndarray-stats = "0.6.0"
+num-complex = { version = "0.4.6", features = ["bytemuck", "libm"] }
+num-traits = { version = "0.2.19", features = ["libm"] }
+rustfft = "6.4.1"
+tract = { version = "0.22.0", features = ["multithread-mm"] }
+tract-core = "0.22.0"
+tract-onnx = "0.22.0"

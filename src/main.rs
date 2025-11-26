@@ -4,11 +4,8 @@ mod utils;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use ndarray::Array2;
 use std::fs;
-use std::path::{Path, PathBuf}; // You might need ndarray-stats or implement simple stats manually. 
-// For simplicity, I will implement manual mean/std to avoid extra deps if you prefer,
-// but ndarray-stats is recommended. I'll use manual here to keep it "pure".
+use std::path::{Path, PathBuf};
 
 use crate::inference::MDXModel;
 
@@ -38,6 +35,14 @@ struct Args {
     /// Segment size (number of frames per inference pass, e.g., 256)
     #[arg(long, default_value_t = 256)]
     segment_size: usize,
+
+    /// Batch size (number of segments to process in parallel)
+    #[arg(long, default_value_t = 4)]
+    batch_size: usize,
+
+    /// Overlap amount (default is segment_size / 2 if not set, but here we explicitly set a default)
+    #[arg(long, default_value_t = 128)]
+    overlap: usize,
 }
 
 fn main() -> Result<()> {
@@ -49,8 +54,15 @@ fn main() -> Result<()> {
     }
 
     println!("Loading model from {:?}...", args.model);
-    let mut model = MDXModel::load(&args.model, args.n_fft, args.hop_length, args.segment_size)
-        .context("Failed to initialize MDX model")?;
+    let mut model = MDXModel::load(
+        &args.model,
+        args.n_fft,
+        args.hop_length,
+        args.segment_size,
+        args.batch_size,
+        args.overlap,
+    )
+    .context("Failed to initialize MDX model")?;
     println!("Model loaded successfully.");
 
     for input_path in &args.input {
@@ -64,25 +76,11 @@ fn process_file(path: &Path, args: &Args, model: &mut MDXModel) -> Result<()> {
     println!("Processing {:?}...", path);
 
     // 1. Load Audio
-    let (mut audio, sample_rate) = audio::load_wav(path.to_str().unwrap())
+    let (audio, sample_rate) = audio::load_wav(path.to_str().unwrap())
         .with_context(|| format!("Failed to load audio file {:?}", path))?;
 
-    // 2. Normalize Audio
-    // Python logic: mix = (mix - mix.mean()) / mix.std()
-    let (mean, std) = calculate_stats(&audio);
-
-    // Avoid division by zero
-    let std = if std == 0.0 { 1.0 } else { std };
-
-    // Apply normalization
-    audio.mapv_inplace(|x| (x - mean) / std);
-
     // 3. Run Inference
-    let mut result = model.demix(&audio)?;
-
-    // 4. Denormalize Audio
-    // Python logic: res = res * std + mean
-    result.mapv_inplace(|x| (x * std) + mean);
+    let result = model.demix(&audio)?;
 
     // 5. Save Result
     let filename = path.file_stem().unwrap().to_str().unwrap();
@@ -95,18 +93,4 @@ fn process_file(path: &Path, args: &Args, model: &mut MDXModel) -> Result<()> {
     println!("Saved to {:?}", output_path);
 
     Ok(())
-}
-
-/// Helper to calculate mean and std deviation of an ndarray
-fn calculate_stats(arr: &Array2<f32>) -> (f32, f32) {
-    let len = arr.len() as f32;
-    if len == 0.0 {
-        return (0.0, 1.0);
-    }
-
-    let mean = arr.sum() / len;
-
-    let variance = arr.iter().map(|&x| (x - mean).powi(2)).sum::<f32>() / len;
-
-    (mean, variance.sqrt())
 }
